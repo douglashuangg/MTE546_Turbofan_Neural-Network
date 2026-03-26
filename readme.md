@@ -1,8 +1,9 @@
 # MTE546 Reliability Weighted Neural Network
 
+Predicting remaining useful life (RUL) of turbofan engines (used in Boeing 777 planes) by evlauating temperature, pressure, speed, and other sensor readings.
 ### Data preprocessing
 
-* Normalizatoin based on operating conditions. Data is only normalized against data that is in the same operating conditions because readings at 40,000 ft are different than at sea level
+* Normalization based on operating conditions. Data is only normalized against data that is in the same operating conditions because readings at 40,000 ft are different than at sea level
 
 
 ## Neural Network Architecture
