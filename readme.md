@@ -20,3 +20,4 @@ Final MLP
 The output of the cleaned sensors is passed into a final neural network to output a RUL
 
 ## Evaluation
+RMSE and NASA score
