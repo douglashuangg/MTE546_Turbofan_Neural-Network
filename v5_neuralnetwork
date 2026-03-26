@@ -1,0 +1,195 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import numpy as np
+import os
+
+# --- SETUP ---
+# CHANGE BASED ON WHERE RUNNING THE CODE
+DATASET_ID = "FD001" 
+KAGGLE_BASE_PATH = "/kaggle/input/datasets/liaaab3/c-mapss-cc/data"
+TRAIN_FILE = os.path.join(KAGGLE_BASE_PATH, f"train_{DATASET_ID}.txt")
+TEST_FILE = os.path.join(KAGGLE_BASE_PATH, f"test_{DATASET_ID}.txt")
+RUL_FILE = os.path.join(KAGGLE_BASE_PATH, f"RUL_{DATASET_ID}.txt")
+
+# --- 1. LOSS FUNCTIONS ---
+def asymmetric_huber_loss(pred, target, delta=10.0, penalty_factor=5.0):
+    error = pred - target
+    mask = (error > 0).float()
+    weight = 1.0 + (mask * (penalty_factor - 1.0))
+    abs_error = torch.abs(error)
+    quadratic = torch.clamp(abs_error, max=delta)
+    linear = abs_error - quadratic
+    loss = 0.5 * quadratic**2 + delta * linear
+    return torch.mean(loss * weight)
+
+def nasa_scoring_function(y_pred, y_true):
+    d = y_pred - y_true
+    early_mask, late_mask = d < 0, d >= 0
+    return torch.sum(torch.exp(-d[early_mask] / 13.0) - 1) + torch.sum(torch.exp(d[late_mask] / 10.0) - 1)
+
+# --- 2. ARCHITECTURE (FIXED FEATURE WASHOUT) ---
+class SensorEncoder(nn.Module):
+    def __init__(self, input_dim=1, hidden_dim=32, feature_dim=16):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Conv1d(hidden_dim, feature_dim, kernel_size=3, padding=1),
+            nn.BatchNorm1d(feature_dim),
+            nn.ReLU()
+        )
+    def forward(self, x):
+        x = self.conv(x)
+        # Returns [batch, feature_dim * 2]
+        return torch.cat([torch.mean(x, dim=-1), torch.max(x, dim=-1)[0]], dim=-1)
+
+class ReliabilityWeightedFusion(nn.Module):
+    def __init__(self, num_sensors=14, feature_dim=16, num_regimes=7):
+        super().__init__()
+        self.num_sensors = num_sensors
+        enc_out_per_sensor = feature_dim * 2 # 32
+        
+        self.regime_embed = nn.Embedding(num_regimes, 8) 
+        self.encoders = nn.ModuleList([SensorEncoder(feature_dim=feature_dim) for _ in range(num_sensors)])
+        
+        # FIX: Calculate dimension for CONCATENATION (32 * 14) + 8 = 456
+        fused_dim = (enc_out_per_sensor * num_sensors) + 8
+        
+        self.predictor = nn.Sequential(
+            nn.Linear(fused_dim, 128), 
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x, regime_idx):
+        emb = self.regime_embed(regime_idx)
+        # Process sensors individually
+        features = [self.encoders[i](x[:, i, :].unsqueeze(1)) for i in range(self.num_sensors)]
+        
+        # CHANGE: Use torch.cat instead of torch.mean to prevent feature washout
+        fused = torch.cat(features, dim=-1) 
+        
+        return self.predictor(torch.cat([fused, emb], dim=-1))
+
+# --- 3. DATASET ---
+class CMAPSSDataset(Dataset):
+    def __init__(self, file_path, sequence_length=50, train_stats=None, max_rul=125):
+        self.sequence_length = sequence_length
+        self.max_rul = max_rul
+        self.sensor_cols = ['s2', 's3', 's4', 's7', 's8', 's9', 's11', 's12', 's13', 's14', 's15', 's17', 's20', 's21']
+
+        df = pd.read_csv(file_path, sep=r'\s+', names=['unit','time','os1','os2','os3']+[f's{i}' for i in range(1,22)])
+        df['RUL'] = (df.groupby('unit')['time'].transform('max') - df['time']).clip(upper=max_rul)
+        
+        # Regime ID Logic
+        df['cond'] = df[['os1', 'os2', 'os3']].round({'os1': -3, 'os2': 1, 'os3': 0}).apply(tuple, axis=1)
+        unique_conds = sorted(df['cond'].unique())
+        self.cond_to_id = {c: i for i, c in enumerate(unique_conds)}
+        df['regime_id'] = df['cond'].map(self.cond_to_id)
+
+        if train_stats is None:
+            self.stats = {c: df.groupby('cond')[c].agg(['mean', 'std']).to_dict('index') for c in self.sensor_cols}
+            self.global_stats = {c: {'mean': df[c].mean(), 'std': df[c].std()} for c in self.sensor_cols}
+            self.mapping = self.cond_to_id
+        else:
+            self.stats, self.global_stats, self.mapping = train_stats['regime'], train_stats['global'], train_stats['mapping']
+
+        for col in self.sensor_cols:
+            def scale(row):
+                s = self.stats[col].get(row['cond'])
+                mu, sig = (s['mean'], s['std']) if s else (self.global_stats[col]['mean'], self.global_stats[col]['std'])
+                return (row[col] - mu) / (sig + 1e-9)
+            df[col] = df.apply(scale, axis=1)
+
+        self.sequences, self.labels, self.regimes, self.units = [], [], [], []
+        for unit_id in df['unit'].unique():
+            u_data = df[df['unit'] == unit_id]
+            if len(u_data) < sequence_length: continue
+            s_mat, r_mat, l_mat = u_data[self.sensor_cols].values, u_data['regime_id'].values, u_data['RUL'].values
+            for i in range(len(u_data) - sequence_length + 1):
+                self.sequences.append(s_mat[i:i+sequence_length])
+                self.labels.append(l_mat[i+sequence_length-1])
+                self.regimes.append(r_mat[i+sequence_length-1])
+                self.units.append(unit_id)
+
+        self.units = np.array(self.units)
+
+    def __len__(self): return len(self.sequences)
+    def __getitem__(self, idx):
+        return (torch.tensor(self.sequences[idx].T, dtype=torch.float32), 
+                torch.tensor(self.regimes[idx], dtype=torch.long), 
+                torch.tensor([self.labels[idx]], dtype=torch.float32))
+
+# --- 4. EVALUATION (FIXED TRAINING SPEED) ---
+def evaluate_model(model, test_ds, truth_path, max_rul=125):
+    model.eval()
+    device = next(model.parameters()).device
+    truth = pd.read_csv(truth_path, header=None).values.flatten()
+    truth = np.clip(truth, 0, max_rul)
+    
+    # Identify last sequence for each engine unit
+    indices = [np.where(test_ds.units == u)[0][-1] for u in np.unique(test_ds.units)]
+    
+    all_p, all_t = [], []
+    with torch.no_grad():
+        # Using a batch size of 1 for precise mapping to truth file units
+        for i in indices:
+            d, r, _ = test_ds[i]
+            d, r = d.unsqueeze(0).to(device), torch.tensor([r]).to(device)
+            p = model(d, r)
+            all_p.append(p.cpu())
+            unit_id = test_ds.units[i] 
+            all_t.append(torch.tensor([[truth[int(unit_id) - 1]]], dtype=torch.float32))
+            
+    p, t = torch.cat(all_p), torch.cat(all_t)
+    return torch.sqrt(F.mse_loss(p, t)).item(), nasa_scoring_function(p, t).item()
+
+# --- 5. TRAINING LOOP (FIXED TRAINING SPEED) ---
+def train_model(train_path, test_path, truth_path, epochs=60):
+    max_rul = 125 
+    
+    # 1. Initialize Train DS
+    train_ds = CMAPSSDataset(train_path, max_rul=max_rul)
+    train_stats = {'regime': train_ds.stats, 'global': train_ds.global_stats, 'mapping': train_ds.mapping}
+    
+    # 2. CHANGE: Initialize Test DS ONCE outside the loop to fix training speed
+    test_ds = CMAPSSDataset(test_path, train_stats=train_stats, max_rul=max_rul)
+    
+    loader = DataLoader(train_ds, batch_size=256, shuffle=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model = ReliabilityWeightedFusion(num_regimes=len(train_ds.mapping)).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-3)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    
+    best_rmse = float('inf')
+
+    print(f"🚀 Training {DATASET_ID} | Sequence: 50 | Piecewise: {max_rul}")
+    for epoch in range(epochs):
+        model.train(); tr_loss = 0
+        for d, r, t in loader:
+            d, r, t = d.to(device), r.to(device), t.to(device)
+            optimizer.zero_grad()
+            p = model(d, r)
+            loss = asymmetric_huber_loss(p, t, delta=10.0, penalty_factor=5.0)
+            loss.backward(); optimizer.step(); tr_loss += torch.sqrt(loss).item()
+        
+        # Pass the pre-loaded test_ds to the evaluation function
+        v_rmse, v_nasa = evaluate_model(model, test_ds, truth_path, max_rul=max_rul)
+        scheduler.step(v_rmse)
+        
+        tag = " [SAVED]" if v_rmse < best_rmse else ""
+        if v_rmse < best_rmse: best_rmse = v_rmse
+        print(f"Epoch {epoch+1:02d} | Loss: {tr_loss/len(loader):.2f} | RMSE: {v_rmse:.2f} | NASA: {int(v_nasa):,}{tag}")
+
+if os.path.exists(TRAIN_FILE): 
+    train_model(TRAIN_FILE, TEST_FILE, RUL_FILE)
